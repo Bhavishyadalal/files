@@ -1,0 +1,94 @@
+{
+  "manifest_version": 3,
+  "name": "127HUB AI",
+  "version": "15.0",
+  "description": "127HUB AI    — premium productivity tools for the Lovable editor.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "cookies",
+    "alarms",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://*.lovable.dev/*",
+    "https://lovable.dev/*",
+    "https://api.lovable.dev/*",
+    "https://lovable-api.com/*",
+    "https://ai.127hub.com/*",
+    "http://localhost:3000/*",
+    "https://lovable.powerkits.net/*"
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "127HUB AI"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.lovable.dev/*",
+        "https://lovable.dev/*"
+      ],
+      "js": [
+        "anti-fingerprint.js",
+        "drag-blocker.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.lovable.dev/*",
+        "https://lovable.dev/*",
+        "https://api.lovable.dev/*"
+      ],
+      "js": [
+        "pageHook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://*.lovable.dev/*",
+        "https://lovable.dev/*",
+        "https://api.lovable.dev/*"
+      ],
+      "js": [
+        "hwFingerprint.js",
+        "content.js",
+        "ota-update.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "payload.js",
+        "anti-fingerprint.js",
+        "hwFingerprint.js",
+        "powerkits-core.js",
+        "powerkits-core.css",
+        "jszip.min.js",
+        "icons/*.png"
+      ],
+      "matches": [
+        "https://*.lovable.dev/*",
+        "https://lovable.dev/*",
+        "https://api.lovable.dev/*"
+      ]
+    }
+  ]
+}
