@@ -38,7 +38,7 @@ import time
 import traceback
 
 APP_NAME = "Live Captions"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEPENDENCIES = [
     ("PySide6", "PySide6-Essentials==6.8.3"),
     ("faster_whisper", "faster-whisper==1.2.1"),
@@ -46,6 +46,7 @@ DEPENDENCIES = [
     ("numpy", "numpy==1.26.4"),
     ("scipy", "scipy==1.13.1"),
     ("huggingface_hub", "huggingface-hub>=0.24,<1"),
+    ("pkg_resources", "setuptools==80.9.0"),
     ("ctranslate2", "ctranslate2==4.6.0"),
     ("onnxruntime", "onnxruntime==1.22.1"),
     ("av", "av==14.2.0"),
@@ -531,6 +532,9 @@ class SetupRunner:
             self.tail.append(line)
         self.emit(text if text.endswith("\n") else text + "\n")
 
+    def stage(self, number, title):
+        self.log(f"[STEP {number}/6] {title}")
+
     def command(self, args, title, allow_failure=False):
         self.check_cancel()
         self.log("\n" + title)
@@ -544,6 +548,7 @@ class SetupRunner:
             self.process = process
             if self.cancelled.is_set():
                 process.terminate()
+        command_tail = collections.deque(maxlen=16)
         try:
             for line in process.stdout:
                 self.check_cancel()
@@ -554,11 +559,12 @@ class SetupRunner:
                         line = str(event[1])
                 except (ValueError, TypeError):
                     pass
+                command_tail.extend(str(line).splitlines())
                 self.log(line)
             code = process.wait()
             self.check_cancel()
             if code and not allow_failure:
-                details = "\n".join(self.tail)[-6000:]
+                details = "\n".join(command_tail)[-4000:]
                 raise RuntimeError(f"{title} failed (exit {code}).\n\n{details}")
             return code
         finally:
@@ -717,10 +723,12 @@ class SetupRunner:
                  "Your existing Python installation will not be modified.")
         completed = setup_ready(self.root) and not self.repair
         if completed and self.validate(allow_failure=True) == 0:
+            self.stage(6, "Ready to launch")
             self.log("Setup is already complete. Starting Live Captions…")
             return
         self.check_cancel()
         (self.root / "setup-ready.json").unlink(missing_ok=True)
+        self.stage(1, "Preparing private Python")
         if not runtime_complete(self.root) or self.repair or completed:
             import zipfile
             archive = self.root / "setup-downloads" / "python-3.12.10-embed-amd64.zip"
@@ -744,26 +752,30 @@ class SetupRunner:
             (runtime_dir(self.root) / "Lib" / "site-packages").mkdir(parents=True, exist_ok=True)
             (runtime_dir(self.root) / "python312._pth").write_text(
                 "python312.zip\n.\nLib/site-packages\nimport site\n", encoding="utf-8")
+        self.stage(2, "Checking Windows components")
         if not self.runtime_available():
             self.install_vc_runtime()
             if not self.runtime_available():
                 raise RuntimeError("Microsoft's C++ runtime is still unavailable. Restart Windows, then open this file again.")
+        self.stage(3, "Installing application libraries")
         pip_exists = self.command([runtime_python(self.root), "-m", "pip", "--version"],
                                   "Checking package installer", allow_failure=True) == 0
         if not pip_exists:
             script = self.fetch("https://bootstrap.pypa.io/get-pip.py", self.root / "setup-downloads" / "get-pip.py")
-            self.command([runtime_python(self.root), script, "pip>=24,<27", "setuptools>=70,<83", "wheel>=0.43,<1",
+            self.command([runtime_python(self.root), script, "pip>=24,<27", "setuptools==80.9.0", "wheel>=0.43,<1",
                           "--only-binary=:all:", "--disable-pip-version-check", "--no-warn-script-location"],
                          "Installing pip, setuptools and wheel")
         pip = [runtime_python(self.root), "-m", "pip", "--isolated", "--disable-pip-version-check", "--no-input",
                "install", "--upgrade", "--only-binary=:all:", "--retries", "3", "--timeout", "30",
                "--no-warn-script-location"]
-        self.command(pip + ["pip>=24,<27", "setuptools>=70,<83", "wheel>=0.43,<1"], "Updating package installer")
+        self.command(pip + ["pip>=24,<27", "setuptools==80.9.0", "wheel>=0.43,<1"], "Updating package installer")
         packages = [spec for _, spec in DEPENDENCIES]
         if self.repair or completed:
             packages = ["--force-reinstall"] + packages
         self.command(pip + packages, "Installing all speech, audio and interface libraries")
+        self.stage(4, "Checking the caption engine")
         self.validate()
+        self.stage(5, "Preparing both speech models")
         for model in ("small", "base"):
             if not model_ready(self.root, model):
                 self.command([runtime_python(self.root), Path(__file__).resolve(), "--download-model", model,
@@ -774,6 +786,7 @@ class SetupRunner:
         tmp = self.root / "setup-ready.tmp"
         tmp.write_text(json.dumps({"fingerprint": setup_fingerprint()}), encoding="utf-8")
         os.replace(tmp, self.root / "setup-ready.json")
+        self.stage(6, "Ready to launch")
         self.log("All components and both speech models are ready. Starting Live Captions…")
 
 
@@ -782,6 +795,14 @@ def native_error(title, detail):
         ctypes.windll.user32.MessageBoxW(None, str(detail), str(title), 0x10)
     else:
         print(f"{title}: {detail}", file=sys.stderr)
+
+
+def setup_error_summary(error):
+    lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+    for line in reversed(lines):
+        if any(token in line for token in ("ModuleNotFoundError:", "ImportError:", "OSError:", "RuntimeError:", "ERROR:")):
+            return line[-900:]
+    return "\n".join(lines[-4:])[-1200:] or "Setup could not finish. Check the setup log for details."
 
 
 def bootstrap_dependencies(root=None, repair=False):
@@ -806,20 +827,58 @@ def bootstrap_dependencies(root=None, repair=False):
                 setup_log.write(traceback.format_exc())
                 native_error("Setup failed", f"{exc}\n\nDetails: {log_path}")
                 return False
-    window.title(f"Live Captions {VERSION} — automatic setup")
-    window.geometry("850x620")
-    window.minsize(650, 450)
-    window.configure(bg="#111827")
-    tk.Label(window, text="Setting up Live Captions", font=("Segoe UI", 21, "bold"),
-             fg="white", bg="#111827").pack(anchor="w", padx=20, pady=(20, 8))
-    tk.Label(window, text="Downloads compatible Python, all libraries and both speech models.\n"
-             "Setup starts automatically. The caption window opens when it finishes.",
-             fg="#cbd5e1", bg="#111827", justify="left").pack(anchor="w", padx=20)
-    status = tk.StringVar(value="Preparing automatic setup…")
-    tk.Label(window, textvariable=status, fg="#93c5fd", bg="#111827", anchor="w",
-             wraplength=790, justify="left").pack(fill="x", padx=20, pady=(12, 0))
-    output = scrolledtext.ScrolledText(window, height=18, bg="#080f1d", fg="#d1d5db", wrap="word")
-    output.pack(fill="both", expand=True, padx=20, pady=14)
+    setup_font = "Segoe UI" if sys.platform == "win32" else "Arial"
+    window.title(f"Live Captions {VERSION} — make yourself at home")
+    window.geometry("960x660")
+    window.minsize(800,560)
+    window.configure(bg="#0b1220")
+    # Setup uses the standard library until Qt has been installed.
+    from tkinter import ttk
+    style = ttk.Style(window)
+    style.theme_use("clam")
+    style.configure("Studio.Horizontal.TProgressbar", troughcolor="#233248", background="#91d9c9",
+                    bordercolor="#233248", lightcolor="#91d9c9", darkcolor="#91d9c9", thickness=6)
+    body = tk.Frame(window,bg="#0b1220"); body.pack(fill="both",expand=True)
+    rail = tk.Frame(body,bg="#080f1b",width=215); rail.pack(side="left",fill="y"); rail.pack_propagate(False)
+    tk.Label(rail,text="LC",font=(setup_font,22,"bold"),bg="#365a71",fg="#f0fffb",padx=14,pady=9).pack(anchor="w",padx=24,pady=(27,13))
+    tk.Label(rail,text="Live Captions",font=(setup_font,17,"bold"),bg="#080f1b",fg="#ecf3ff").pack(anchor="w",padx=24)
+    tk.Label(rail,text="A little closer to the world.",font=(setup_font,9),bg="#080f1b",fg="#859bb6").pack(anchor="w",padx=24,pady=(4,32))
+    tk.Label(rail,text="YOUR SETUP",font=(setup_font,9,"bold"),bg="#080f1b",fg="#7088a8").pack(anchor="w",padx=24,pady=(0,12))
+    stage_labels=[]
+    for i,title in enumerate(("Private Python","Windows components","App libraries","Engine check","Speech models","Ready to listen"),1):
+        label=tk.Label(rail,text=f"{i:02d}    {title}",font=(setup_font,10),bg="#080f1b",fg="#6f86a5",padx=8,pady=11,anchor="w")
+        label.pack(fill="x",padx=16,pady=3);stage_labels.append(label)
+    tk.Label(rail,text="YOUR AUDIO STAYS YOURS\nOffline after setup.\nNo account. No cloud API.",font=(setup_font,9),justify="left",
+             bg="#080f1b",fg="#829ab8",padx=24,pady=25,anchor="w").pack(side="bottom",fill="x")
+    workspace=tk.Frame(body,bg="#0b1220");workspace.pack(side="left",fill="both",expand=True,padx=28,pady=25)
+    tk.Label(workspace,text="MAKE YOURSELF AT HOME",font=(setup_font,9,"bold"),fg="#82bdbe",bg="#0b1220").pack(anchor="w")
+    tk.Label(workspace,text="Your next words,\nin English.",font=(setup_font,29,"bold"),justify="left",fg="#f0f4fc",bg="#0b1220").pack(anchor="w",pady=(9,7))
+    tk.Label(workspace,text="We're getting your caption studio ready. Compatible Python,\nall the libraries, and both speech models — in one place.",
+             font=(setup_font,10),justify="left",fg="#8ea5c1",bg="#0b1220").pack(anchor="w",pady=(0,22))
+    progress_card=tk.Frame(workspace,bg="#152235",highlightbackground="#2a3f58",highlightthickness=1,padx=20,pady=19)
+    progress_card.pack(fill="x")
+    stage_title=tk.StringVar(value="Preparing your studio")
+    tk.Label(progress_card,textvariable=stage_title,font=(setup_font,14,"bold"),fg="#e7f2fd",bg="#152235",anchor="w").pack(fill="x")
+    stage_detail=tk.StringVar(value="Setup starts automatically. You can leave this window open.")
+    status = tk.StringVar(value="Checking your installation…")
+    tk.Label(progress_card,textvariable=stage_detail,font=(setup_font,9),fg="#86a2c0",bg="#152235",anchor="w").pack(fill="x",pady=(6,14))
+    progress=ttk.Progressbar(progress_card,style="Studio.Horizontal.TProgressbar",mode="determinate",maximum=6,value=0)
+    progress.pack(fill="x")
+    status_label=tk.Label(progress_card,textvariable=status,font=(setup_font,9),fg="#a6bacf",bg="#152235",anchor="w",justify="left",wraplength=560)
+    status_label.pack(fill="x",pady=(13,0))
+    progress_card.bind("<Configure>",lambda event:status_label.configure(wraplength=max(160,event.width-45)))
+    details_open=tk.BooleanVar(value=False)
+    details_button=tk.Checkbutton(workspace,text="Show setup details",variable=details_open,bg="#0b1220",fg="#91a9c6",
+                    activebackground="#0b1220",activeforeground="#c6e5ef",selectcolor="#1a2b40",font=(setup_font,9),highlightthickness=0)
+    details_button.pack(anchor="w",pady=(14,7))
+    output = scrolledtext.ScrolledText(workspace,height=6,bg="#080f1b",fg="#a7bdd5",insertbackground="white",
+                                      relief="flat",borderwidth=0,wrap="word",font=("Consolas",9),padx=12,pady=10)
+    def show_details():
+        if details_open.get():
+            output.pack(fill="both",expand=True,before=buttons,pady=(0,12))
+        else:
+            output.pack_forget()
+    details_button.configure(command=show_details)
     state = {"running": False, "success": False, "closing": False, "log": None, "attempted": False}
     def emit(text):
         if state["log"]:
@@ -843,57 +902,61 @@ def bootstrap_dependencies(root=None, repair=False):
             state["running"] = False
             messagebox.showerror("Cannot write setup log", f"{exc}\n\nCheck write access to {root} and retry setup.")
             return
-        output.delete("1.0", "end")
-        retry.configure(state="disabled")
-        cancel.configure(state="normal", text="Cancel setup")
+        output.delete("1.0", "end");progress["value"]=0
+        stage_title.set("Preparing your studio")
+        retry.configure(state="disabled");cancel.configure(state="normal",text="Cancel")
         def worker():
             try:
-                runner.run()
-                messages.put(("done", None))
+                runner.run();messages.put(("done",None))
             except SetupCancelled as exc:
-                emit(str(exc) + "\n")
-                messages.put(("cancelled", str(exc)))
+                emit(str(exc)+"\n");messages.put(("cancelled",str(exc)))
             except Exception as exc:
-                LOG.exception("Automatic setup failed")
-                emit(traceback.format_exc())
-                messages.put(("error", str(exc)))
-        threading.Thread(target=worker, name="automatic-setup", daemon=True).start()
+                LOG.exception("Automatic setup failed");emit(traceback.format_exc());messages.put(("error",str(exc)))
+        threading.Thread(target=worker,name="automatic-setup",daemon=True).start()
     def poll():
         try:
             while True:
-                kind, value = messages.get_nowait()
-                if kind == "line":
-                    output.insert("end", value)
-                    output.see("end")
-                    lines = value.strip().splitlines()
-                    if lines:
-                        status.set(lines[-1][:240])
+                kind,value=messages.get_nowait()
+                if kind=="line":
+                    output.insert("end",value);output.see("end")
+                    for line in value.strip().splitlines():
+                        if line.startswith("[STEP "):
+                            try:
+                                number=int(line[6]);title=line.split("] ",1)[1]
+                                stage_title.set(title);stage_detail.set(f"Step {number} of 6 · Automatic setup")
+                                progress["value"]=number-1
+                                for i,label in enumerate(stage_labels,1):
+                                    label.configure(fg="#a2dacc" if i<number else "#ebf6ff" if i==number else "#6f86a5",
+                                                    bg="#15253a" if i==number else "#080f1b")
+                            except (ValueError,IndexError):
+                                pass
+                        else:
+                            status.set(line[-190:])
                 else:
-                    state["running"] = False
+                    state["running"]=False
                     if state["log"]:
-                        state["log"].close()
-                        state["log"] = None
+                        state["log"].close();state["log"]=None
                     if state["closing"]:
-                        window.destroy()
-                        return
-                    if kind == "done":
-                        state["success"] = True
-                        window.destroy()
-                        return
-                    retry.configure(state="normal", text="Retry / repair setup")
-                    cancel.configure(text="Close")
-                    if kind == "error":
-                        status.set("Setup failed — the actual error is shown below and saved in setup.log")
-                        messagebox.showerror("Setup failed", value[-4500:] + f"\n\nFull setup log: {log_path}")
+                        window.destroy();return
+                    if kind=="done":
+                        state["success"]=True;progress["value"]=6;window.destroy();return
+                    retry.configure(state="normal",text="Retry setup");cancel.configure(text="Close")
+                    if kind=="error":
+                        stage_title.set("Let's get this sorted")
+                        stage_detail.set("Setup paused · Your progress is saved")
+                        status.set("The actual error is in the details. Copy the log if you need help.")
+                        details_open.set(True);show_details()
+                        summary=setup_error_summary(value)
+                        messagebox.showerror("Setup paused",summary+f"\n\nFull details: {log_path}\n\nUse Retry setup, or Copy setup log to share the error.")
                     else:
-                        status.set("Setup cancelled. Retry to continue.")
+                        stage_title.set("Pick up where you left off")
+                        status.set("Setup cancelled. Retry when you're ready.")
         except queue.Empty:
             pass
-        window.after(100, poll)
+        window.after(100,poll)
     def close():
         if state["running"]:
-            state["closing"] = True
-            runner.cancel()
+            state["closing"]=True;runner.cancel()
             status.set("Cancelling… Waiting for any running installer to finish safely.")
             cancel.configure(state="disabled")
         else:
@@ -902,22 +965,21 @@ def bootstrap_dependencies(root=None, repair=False):
         window.clipboard_clear()
         try:
             window.clipboard_append(log_path.read_text(encoding="utf-8"))
-            status.set("Setup log copied. You can paste it when asking for help.")
+            status.set("Log copied. Paste it when asking for help.")
         except OSError:
-            status.set("No setup log has been written yet.")
-    row = tk.Frame(window, bg="#111827")
-    row.pack(fill="x", padx=20, pady=(0, 16))
-    retry = tk.Button(row, text="Install / repair", command=install, padx=16, pady=7)
-    retry.pack(side="left")
-    tk.Button(row, text="Copy setup log", command=copy_log, padx=16, pady=7).pack(side="left", padx=10)
-    cancel = tk.Button(row, text="Cancel setup", command=close, padx=16, pady=7)
-    cancel.pack(side="right")
-    window.protocol("WM_DELETE_WINDOW", close)
-    window.after(100, poll)
-    window.after(300, install)
-    window.mainloop()
+            status.set("Your setup log hasn't been written yet.")
+    buttons=tk.Frame(workspace,bg="#0b1220");buttons.pack(side="bottom",fill="x",pady=(12,0))
+    def button(text,command,primary=False):
+        return tk.Button(buttons,text=text,command=command,font=(setup_font,10,"bold" if primary else "normal"),
+                         bg="#95d9cc" if primary else "#1d2d43",fg="#132735" if primary else "#bfcee1",
+                         activebackground="#b3ebdf" if primary else "#2d445f",activeforeground="#132735" if primary else "white",
+                         disabledforeground="#597184",relief="flat",borderwidth=0,highlightthickness=0,padx=15,pady=10,cursor="hand2")
+    retry=button("Retry setup",install,True);retry.pack(side="left")
+    button("Copy setup log",copy_log).pack(side="left",padx=9)
+    cancel=button("Cancel",close);cancel.pack(side="right")
+    window.protocol("WM_DELETE_WINDOW",close)
+    window.after(100,poll);window.after(300,install);window.mainloop()
     return state["success"]
-
 
 def launch_managed(root):
     with (root / "launch.log").open("w", encoding="utf-8") as output:
@@ -995,17 +1057,137 @@ Redistributable (x64), then reopen the app.
 
 
 def run_gui(root: Path, smoke_test=False, test_hook=None):
-    from PySide6.QtCore import Qt, QObject, Signal, QTimer, QPoint, QRectF, QLockFile
-    from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPixmap, QAction
+    from PySide6.QtCore import Qt, QObject, Signal, QTimer, QPoint, QRectF, QLockFile, QSize
+    from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPixmap, QAction, QPen, QLinearGradient, QRadialGradient, QPainterPath, QPalette
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
         QFormLayout, QComboBox, QSpinBox, QDoubleSpinBox, QSlider, QCheckBox, QTabWidget,
         QPlainTextEdit, QProgressBar, QMessageBox, QFileDialog, QSystemTrayIcon, QMenu,
-        QGroupBox, QScrollArea, QSizePolicy,
+        QGroupBox, QScrollArea, QSizePolicy, QFrame, QGridLayout, QToolButton, QGraphicsDropShadowEffect, QButtonGroup,
     )
 
     class Bridge(QObject):
         event = Signal(str, object)
+
+    def glyph(kind, color="#a8b5d0"):
+        pixmap = QPixmap(28, 28)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(color), 1.7))
+        if kind in ("studio", "captions"):
+            painter.drawRoundedRect(QRectF(4, 6, 20, 15), 4, 4)
+            if kind == "studio":
+                for x, height in ((9, 4), (14, 9), (19, 6)):
+                    painter.drawLine(x, 14 - height // 2, x, 14 + height // 2)
+            else:
+                painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+                painter.drawText(QRectF(4, 6, 20, 15), Qt.AlignmentFlag.AlignCenter, "CC")
+        elif kind == "history":
+            painter.drawEllipse(QRectF(5, 5, 18, 18))
+            painter.drawLine(14, 9, 14, 14)
+            painter.drawLine(14, 14, 18, 16)
+        elif kind == "help":
+            painter.drawEllipse(QRectF(5, 5, 18, 18))
+            painter.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
+            painter.drawText(QRectF(5, 4, 18, 20), Qt.AlignmentFlag.AlignCenter, "?")
+        elif kind == "play":
+            path = QPainterPath()
+            path.moveTo(10, 6); path.lineTo(22, 14); path.lineTo(10, 22); path.closeSubpath()
+            painter.fillPath(path, QColor(color))
+        elif kind == "stop":
+            painter.setBrush(QColor(color))
+            painter.drawRoundedRect(QRectF(8, 8, 12, 12), 3, 3)
+        elif kind == "shield":
+            path = QPainterPath()
+            path.moveTo(14, 4); path.lineTo(23, 8); path.lineTo(22, 17)
+            path.quadTo(19, 23, 14, 25); path.quadTo(7, 22, 6, 16)
+            path.lineTo(5, 8); path.closeSubpath()
+            painter.drawPath(path)
+            painter.drawLine(10, 14, 13, 17); painter.drawLine(13, 17, 19, 11)
+        painter.end()
+        return QIcon(pixmap)
+
+    class GlassCanvas(QWidget):
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor("#090e1a"))
+            for x, y, radius, color in (
+                (self.width() * .92, 0, 730, QColor(39, 75, 107, 90)),
+                (self.width() * .35, self.height(), 660, QColor(70, 43, 117, 66)),
+                (self.width() * .58, self.height() * .4, 480, QColor(24, 86, 90, 26)),
+            ):
+                gradient = QRadialGradient(x, y, radius)
+                gradient.setColorAt(0, color)
+                gradient.setColorAt(1, QColor(color.red(), color.green(), color.blue(), 0))
+                painter.fillRect(self.rect(), gradient)
+
+    class CaptionPreview(QWidget):
+        """Static vector artwork: no image download, web engine or animation loop."""
+        def __init__(self, settings, parent=None):
+            super().__init__(parent)
+            self.settings = settings
+            self.caption = "A world of voices.\nOne clear language."
+            self.setMinimumHeight(185)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+            clip = QPainterPath(); clip.addRoundedRect(bounds, 15, 15)
+            painter.setClipPath(clip)
+            sky = QLinearGradient(0, 0, self.width(), self.height())
+            sky.setColorAt(0, QColor("#203a49")); sky.setColorAt(.5, QColor("#19243b")); sky.setColorAt(1, QColor("#393057"))
+            painter.fillRect(self.rect(), sky)
+            glow = QRadialGradient(self.width() * .7, self.height() * .2, self.width() * .55)
+            glow.setColorAt(0, QColor(128, 185, 170, 70)); glow.setColorAt(1, QColor(58, 98, 128, 0))
+            painter.fillRect(self.rect(), glow)
+            # A quiet mountain silhouette gives the subtitle sample a cinematic setting.
+            for offset, tint in ((.18, "#202e44"), (.35, "#172437"), (.50, "#121d2e")):
+                path = QPainterPath(); path.moveTo(-10, self.height())
+                for i, value in enumerate((.7, .35, .55, .13, .48, .25, .55, .3, .7)):
+                    path.lineTo(i * self.width() / 8, self.height() * (value * .55 + offset))
+                path.lineTo(self.width()+10, self.height()); path.closeSubpath()
+                painter.fillPath(path, QColor(tint))
+            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+            painter.setPen(QColor("#d2e0e7"))
+            painter.drawText(QRectF(17, 13, self.width()-34, 18), Qt.AlignmentFlag.AlignLeft, "CAPTION PREVIEW")
+            painter.setPen(QColor("#8cbbba"))
+            painter.drawText(QRectF(17, 13, self.width()-34, 18), Qt.AlignmentFlag.AlignRight, "ENGLISH")
+            caption_box = QRectF(17, self.height() * .48, self.width()-34, self.height() * .39)
+            painter.setPen(QPen(QColor(255,255,255,35), 1))
+            painter.setBrush(QColor(9, 16, 28, int(self.settings.opacity * 2.2)))
+            painter.drawRoundedRect(caption_box, 10, 10)
+            painter.setFont(QFont("Segoe UI", min(17, max(11, self.settings.font_size // 2)), QFont.Weight.DemiBold))
+            painter.setPen(QColor("#f4f8fc"))
+            text = self.caption
+            if len(text) > 120:
+                text = text[:117] + "…"  # this miniature is a preview; full text remains in the overlay/history
+            painter.drawText(caption_box.adjusted(12, 5, -12, -5),
+                             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
+            painter.setClipping(False)
+            painter.setPen(QPen(QColor(217,234,255,35), 1)); painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(bounds, 15, 15)
+
+    class AudioScope(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.values = collections.deque([0.02] * 48, maxlen=48)
+            self.setFixedHeight(48)
+        def push(self, db):
+            self.values.append(max(.02, min(1., (db+70)/55)))
+            self.update()
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            step = self.width() / 48
+            for index, value in enumerate(self.values):
+                height = max(2, value * (self.height()-6))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(97, 210, 190, 60 + int(value * 170)))
+                painter.drawRoundedRect(QRectF(index*step+1, (self.height()-height)/2,
+                                              max(1, step-3), height), 2, 2)
 
     class Overlay(QWidget):
         def __init__(self, settings):
@@ -1113,9 +1295,13 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
         def paintEvent(self, event):
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(8, 12, 20, int(self.settings.opacity * 2.55)))
-            painter.drawRoundedRect(QRectF(self.rect()), 12, 12)
+            glass = QLinearGradient(0,0,0,self.height())
+            alpha = min(255, round(self.settings.opacity*2.55))
+            glass.setColorAt(0, QColor(28,40,58,alpha))
+            glass.setColorAt(1, QColor(7,13,24,alpha))
+            painter.setPen(QPen(QColor(220,239,255,45),1))
+            painter.setBrush(glass)
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(1,1,-1,-1), 16, 16)
             if not self.settings.locked:
                 painter.setPen(QColor(130, 145, 165, 150))
                 painter.drawLine(self.width() // 2 - 18, 6, self.width() // 2 + 18, 6)
@@ -1148,56 +1334,78 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
             self.want_close = False
             self.history = collections.deque(maxlen=500)
             self.notice = ""
-            self.setWindowTitle(f"{APP_NAME} · Offline English translation")
-            self.resize(860, 780)
-            self.setMinimumSize(650, 600)
+            self.setWindowTitle(f"{APP_NAME} · Translation studio")
+            area = app.primaryScreen().availableGeometry()
+            self.resize(min(1180, max(920, area.width()-60)), min(850, max(620, area.height()-60)))
+            self.setMinimumSize(880, 600)
             self.setWindowIcon(icon)
             self.overlay = Overlay(self.settings)
             if self.settings.overlay_x != -1 or self.settings.overlay_y != -1:
                 candidate = QPoint(self.settings.overlay_x, self.settings.overlay_y)
-                # Restore a dragged position only if its center still fits a display.
-                if any(s.availableGeometry().contains(candidate + QPoint(self.overlay.width() // 2, self.overlay.height() // 2))
+                if any(s.availableGeometry().contains(candidate + QPoint(self.overlay.width()//2, self.overlay.height()//2))
                        for s in app.screens()):
                     self.overlay.move(candidate)
-            main = QWidget()
+            main = GlassCanvas()
             self.setCentralWidget(main)
-            layout = QVBoxLayout(main)
-            layout.setContentsMargins(26, 22, 26, 20)
-            title = QLabel("Live Captions")
-            title.setObjectName("title")
-            layout.addWidget(title)
-            subtitle = QLabel("Your browser audio. English captions. Entirely on your computer.")
-            subtitle.setObjectName("muted")
-            layout.addWidget(subtitle)
-            self.tabs = QTabWidget()
-            layout.addWidget(self.tabs, 1)
-            self.make_translation_tab()
-            self.make_caption_tab()
-            self.make_history_tab()
-            help_text = QPlainTextEdit()
-            help_text.setPlainText(HELP)
-            help_text.setReadOnly(True)
-            self.tabs.addTab(help_text, "Help")
-            self.status = QLabel("Ready — download a model, then start")
-            self.status.setWordWrap(True)
-            layout.addWidget(self.status)
-            self.warning = QLabel("")
-            self.warning.setWordWrap(True)
-            self.warning.setStyleSheet("color: #fbbf24;")
-            layout.addWidget(self.warning)
-            row = QHBoxLayout()
-            self.start_button = QPushButton("Start captions")
-            self.start_button.setObjectName("primary")
-            self.start_button.clicked.connect(self.start)
-            self.stop_button = QPushButton("Stop")
-            self.stop_button.setEnabled(False)
-            self.stop_button.clicked.connect(self.stop)
-            self.min_button = QPushButton("Minimize to tray")
-            self.min_button.clicked.connect(self.minimize_tray)
-            row.addWidget(self.start_button, 2)
-            row.addWidget(self.stop_button)
-            row.addWidget(self.min_button)
-            layout.addLayout(row)
+            outer = QHBoxLayout(main); outer.setSpacing(0); outer.setContentsMargins(0,0,0,0)
+            sidebar = QFrame(); sidebar.setObjectName("sidebar"); sidebar.setFixedWidth(186)
+            side = QVBoxLayout(sidebar); side.setContentsMargins(18,28,18,22); side.setSpacing(8)
+            brand = QLabel("LC"); brand.setObjectName("brandMark"); brand.setFixedSize(46,46)
+            brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            side.addWidget(brand)
+            brand_title = QLabel("Live Captions"); brand_title.setObjectName("brandTitle")
+            side.addWidget(brand_title)
+            tag = QLabel("A little closer to the world."); tag.setWordWrap(True); tag.setObjectName("muted")
+            side.addWidget(tag); side.addSpacing(30)
+            eyebrow = QLabel("WORKSPACE"); eyebrow.setObjectName("eyebrow"); side.addWidget(eyebrow)
+            self.nav_buttons = []
+            self.nav_group = QButtonGroup(self)
+            for index, (label, kind) in enumerate((("Studio", "studio"), ("Captions", "captions"),
+                                                    ("History", "history"), ("Help & setup", "help"))):
+                button = QPushButton(label); button.setObjectName("navButton")
+                button.setIcon(glyph(kind)); button.setIconSize(QSize(24,24)); button.setCheckable(True)
+                button.clicked.connect(lambda checked=False, i=index: self.tabs.setCurrentIndex(i))
+                self.nav_buttons.append(button); self.nav_group.addButton(button); side.addWidget(button)
+            side.addStretch()
+            privacy = QLabel("ON YOUR DEVICE"); privacy.setObjectName("eyebrow"); side.addWidget(privacy)
+            private = QLabel("Your audio stays yours.\nNo account. No cloud API.")
+            private.setObjectName("muted"); private.setWordWrap(True); side.addWidget(private)
+            side.addSpacing(12)
+            version = QLabel(f"DESKTOP  /  v{VERSION}"); version.setObjectName("version"); side.addWidget(version)
+            outer.addWidget(sidebar)
+            workspace = QWidget(); content = QVBoxLayout(workspace)
+            content.setContentsMargins(26,24,26,22); content.setSpacing(14)
+            top = QHBoxLayout()
+            headings = QVBoxLayout(); headings.setSpacing(4)
+            self.page_title = QLabel("Translation studio"); self.page_title.setObjectName("pageTitle")
+            self.page_subtitle = QLabel("A world of voices. One clear language.")
+            self.page_subtitle.setObjectName("subtitle"); self.page_subtitle.setWordWrap(True)
+            headings.addWidget(self.page_title); headings.addWidget(self.page_subtitle); top.addLayout(headings,1)
+            self.state_badge = QLabel("●  ON-DEVICE"); self.state_badge.setObjectName("stateBadge")
+            top.addWidget(self.state_badge,0,Qt.AlignmentFlag.AlignTop); content.addLayout(top)
+            self.tabs = QTabWidget(); self.tabs.tabBar().hide(); self.tabs.setObjectName("workspaceTabs")
+            self.make_translation_tab(); self.make_caption_tab(); self.make_history_tab()
+            help_page = QWidget(); help_layout = QVBoxLayout(help_page); help_layout.setContentsMargins(0,0,0,0)
+            help_heading = QLabel("Make yourself at home"); help_heading.setObjectName("sectionTitle")
+            help_layout.addWidget(help_heading)
+            help_text = QPlainTextEdit(); help_text.setPlainText(HELP); help_text.setReadOnly(True)
+            help_layout.addWidget(help_text); self.tabs.addTab(help_page, "Help")
+            self.tabs.currentChanged.connect(self.navigate); self.navigate(0)
+            content.addWidget(self.tabs,1)
+            footer = QFrame(); footer.setObjectName("controlDock")
+            dock = QVBoxLayout(footer); dock.setContentsMargins(16,13,16,13); dock.setSpacing(6)
+            self.warning = QLabel(""); self.warning.setObjectName("warningLabel"); self.warning.setWordWrap(True)
+            dock.addWidget(self.warning)
+            row = QHBoxLayout(); row.setSpacing(9)
+            self.status = QLabel("Ready — automatic setup prepares your models")
+            self.status.setObjectName("statusText"); self.status.setWordWrap(True); row.addWidget(self.status,1)
+            self.start_button = QPushButton("Start captions"); self.start_button.setObjectName("primary")
+            self.start_button.setIcon(glyph("play", "#132535")); self.start_button.clicked.connect(self.start)
+            self.stop_button = QPushButton("Stop"); self.stop_button.setObjectName("stopButton")
+            self.stop_button.setIcon(glyph("stop")); self.stop_button.setEnabled(False); self.stop_button.clicked.connect(self.stop)
+            self.min_button = QPushButton("To tray"); self.min_button.clicked.connect(self.minimize_tray)
+            row.addWidget(self.start_button); row.addWidget(self.stop_button); row.addWidget(self.min_button)
+            dock.addLayout(row); content.addWidget(footer); outer.addWidget(workspace,1)
             self.tray = QSystemTrayIcon(icon, self)
             self.tray.setToolTip("Live Captions — offline English translation")
             menu = QMenu()
@@ -1230,158 +1438,190 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
                 self.refresh_devices()
             app.screenAdded.connect(lambda _: self.refresh_screens())
             app.screenRemoved.connect(lambda _: self.refresh_screens())
+            self.update_layout_density()
+
+        def navigate(self, index):
+            titles = (("Translation studio", "A world of voices. One clear language."),
+                      ("Your captions, your way", "Find the perfect place for every word."),
+                      ("A little context", "Revisit the words you just heard."),
+                      ("Help & setup", "Everything you need to feel at home."))
+            self.page_title.setText(titles[index][0]); self.page_subtitle.setText(titles[index][1])
+            for i, button in enumerate(self.nav_buttons):
+                button.setChecked(i == index)
+
+        def card(self, title, subtitle=""):
+            frame = QFrame(); frame.setObjectName("glassCard")
+            layout = QVBoxLayout(frame); layout.setContentsMargins(18,16,18,17); layout.setSpacing(11)
+            heading = QLabel(title); heading.setObjectName("sectionTitle"); layout.addWidget(heading)
+            if subtitle:
+                note = QLabel(subtitle); note.setWordWrap(True); note.setObjectName("muted"); layout.addWidget(note)
+            return frame, layout
 
         def form_page(self, label):
-            page = QWidget()
-            layout = QVBoxLayout(page)
-            layout.setContentsMargins(18, 18, 18, 18)
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-            scroll.setWidget(page)
-            self.tabs.addTab(scroll, label)
+            page = QWidget(); page.setObjectName("pageBody")
+            layout = QVBoxLayout(page); layout.setContentsMargins(0,0,6,0); layout.setSpacing(14)
+            scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setWidget(page); self.tabs.addTab(scroll, label)
             return layout
 
         def make_translation_tab(self):
             layout = self.form_page("Translation")
-            group = QGroupBox("Speech and translation")
-            form = QFormLayout(group)
-            self.mode = QComboBox()
+            grid = QGridLayout(); grid.setSpacing(14)
+            self.studio_grid = grid
+            left = QVBoxLayout(); left.setSpacing(14)
+            right = QVBoxLayout(); right.setSpacing(14)
+            self.studio_right = right
+            frame, card = self.card("Translation engine", "Choose your balance of detail and speed.")
+            self.mode = QComboBox(self); self.mode.hide()
             for label, value in MODEL_LABELS.items():
                 self.mode.addItem(label, value)
             self.mode.setCurrentIndex(self.mode.findData(self.settings.model))
-            self.language = QComboBox()
-            self.language.addItems(LANGUAGES)
-            self.language.setCurrentText(self.settings.language)
-            form.addRow("Mode", self.mode)
-            form.addRow("Spoken language", self.language)
-            self.model_status = QLabel()
-            self.model_status.setWordWrap(True)
-            self.download_button = QPushButton("Download selected model")
-            self.download_button.clicked.connect(self.download)
-            form.addRow("Local model", self.model_status)
-            form.addRow("", self.download_button)
-            self.download_progress = QProgressBar()
-            self.download_progress.setRange(0, 0)
-            self.download_progress.hide()
-            form.addRow("", self.download_progress)
-            self.cancel_download_button = QPushButton("Cancel download")
-            self.cancel_download_button.clicked.connect(self.cancel_download)
-            self.cancel_download_button.hide()
-            form.addRow("", self.cancel_download_button)
-            layout.addWidget(group)
-            group = QGroupBox("Windows playback audio")
-            form = QFormLayout(group)
-            self.devices = QComboBox()
-            self.devices.addItem("Windows default at last refresh", None)
-            self.refresh_button = QPushButton("Refresh devices")
-            self.refresh_button.clicked.connect(self.refresh_devices)
-            form.addRow("Output device", self.devices)
-            form.addRow("", self.refresh_button)
-            self.meter = QProgressBar()
-            self.meter.setRange(0, 80)
-            self.meter.setValue(0)
-            self.meter.setFormat("Audio level")
-            form.addRow("Playback meter", self.meter)
-            layout.addWidget(group)
-            group = QGroupBox("Performance · stop captions before changing")
-            form = QFormLayout(group)
-            self.threads = QSpinBox()
-            self.threads.setRange(1, min(4, os.cpu_count() or 2))
-            self.threads.setValue(self.settings.threads)
-            self.threads.setToolTip("Two threads is a useful starting point for an i5-6500 with a browser open.")
-            self.chunk = QDoubleSpinBox()
-            self.chunk.setRange(2, 10)
-            self.chunk.setSingleStep(0.5)
-            self.chunk.setSuffix(" seconds")
-            self.chunk.setValue(self.settings.chunk_seconds)
-            self.chunk.setToolTip("Maximum phrase length. Shorter is quicker; longer preserves more context.")
-            self.silence = QDoubleSpinBox()
-            self.silence.setRange(0.3, 1.5)
-            self.silence.setSingleStep(0.1)
-            self.silence.setSuffix(" seconds")
-            self.silence.setValue(self.settings.silence_seconds)
-            self.gate = QSpinBox()
-            self.gate.setRange(-70, -20)
-            self.gate.setSuffix(" dB")
-            self.gate.setValue(self.settings.gate_db)
-            self.gate.setToolTip("Lower (more negative) captures quieter dialogue, but admits more noise.")
-            form.addRow("CPU threads", self.threads)
-            form.addRow("Maximum phrase", self.chunk)
-            form.addRow("End phrase after silence", self.silence)
-            form.addRow("Speech gate", self.gate)
-            layout.addWidget(group)
-            self.metrics = QLabel("Processing —  |  Delay —  |  Skipped audio chunks: 0")
-            self.metrics.setWordWrap(True)
-            layout.addWidget(self.metrics)
-            self.resources = QLabel("CPU —  |  App memory —")
-            self.resources.setObjectName("muted")
-            layout.addWidget(self.resources)
-            layout.addStretch()
+            choices = QHBoxLayout(); choices.setSpacing(8); self.mode_cards = {}
+            self.mode_button_group = QButtonGroup(self)
+            for name, value, hint in (("Quality", "small", "Richer context · Small"), ("Fast", "base", "Lighter & quicker · Base")):
+                button = QPushButton(name + "\n" + hint); button.setObjectName("modeCard")
+                button.setCheckable(True); button.setMinimumHeight(76)
+                button.setToolTip("Whisper small, INT8" if value == "small" else "Whisper base, INT8")
+                button.clicked.connect(lambda checked=False, m=value: self.mode.setCurrentIndex(self.mode.findData(m)))
+                self.mode_cards[value] = button; self.mode_button_group.addButton(button); choices.addWidget(button,1)
+            card.addLayout(choices)
+            label = QLabel("SPOKEN LANGUAGE"); label.setObjectName("eyebrow"); card.addWidget(label)
+            self.language = QComboBox(); self.language.addItems(LANGUAGES)
+            self.language.setCurrentText(self.settings.language); card.addWidget(self.language)
+            output = QLabel("↳  Translated into English"); output.setObjectName("accentText"); card.addWidget(output)
+            self.model_status = QLabel(); self.model_status.setWordWrap(True); self.model_status.setObjectName("muted")
+            card.addWidget(self.model_status)
+            self.download_button = QPushButton("Download selected model"); self.download_button.setObjectName("quietButton")
+            self.download_button.clicked.connect(self.download); card.addWidget(self.download_button)
+            self.download_progress = QProgressBar(); self.download_progress.setRange(0,0); self.download_progress.hide()
+            card.addWidget(self.download_progress)
+            self.cancel_download_button = QPushButton("Cancel download"); self.cancel_download_button.clicked.connect(self.cancel_download)
+            self.cancel_download_button.hide(); card.addWidget(self.cancel_download_button)
+            left.addWidget(frame)
+            frame, card = self.card("Audio source", "Listen to the sound playing on your PC.")
+            self.devices = QComboBox(); self.devices.addItem("Windows default at last refresh", None)
+            self.devices.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            self.devices.setMinimumContentsLength(12); card.addWidget(self.devices)
+            self.refresh_button = QPushButton("Refresh devices"); self.refresh_button.setObjectName("quietButton")
+            self.refresh_button.clicked.connect(self.refresh_devices); card.addWidget(self.refresh_button)
+            left.addWidget(frame); left.addStretch()
+            frame, card = self.card("The words, without the distance", "A floating caption layer, wherever you watch.")
+            self.studio_preview = CaptionPreview(self.settings); card.addWidget(self.studio_preview,1)
+            right.addWidget(frame)
+            frame, card = self.card("Listening room")
+            self.audio_scope = AudioScope(); card.addWidget(self.audio_scope)
+            self.meter = QProgressBar(); self.meter.setRange(0,80); self.meter.setValue(0)
+            self.meter.setFixedHeight(6); self.meter.setTextVisible(False); self.meter.setFormat("Audio level")
+            card.addWidget(self.meter)
+            self.audio_level_text = QLabel("Waiting for playback audio"); self.audio_level_text.setObjectName("muted")
+            card.addWidget(self.audio_level_text)
+            self.metrics = QLabel("Processing —  ·  Delay —  ·  Skipped: 0")
+            self.metrics.setWordWrap(True); self.metrics.setObjectName("muted"); card.addWidget(self.metrics)
+            self.resources = QLabel("CPU —  ·  App memory —"); self.resources.setWordWrap(True)
+            self.resources.setObjectName("muted"); card.addWidget(self.resources)
+            right.addWidget(frame); right.addStretch()
+            grid.addLayout(left,0,0); grid.addLayout(right,0,1)
+            grid.setColumnStretch(0,1); grid.setColumnStretch(1,1); layout.addLayout(grid)
+            advanced = QFrame(); advanced.setObjectName("glassCard")
+            advanced_layout = QVBoxLayout(advanced); advanced_layout.setContentsMargins(16,9,16,9)
+            self.advanced_button = QToolButton(); self.advanced_button.setText("Performance tuning")
+            self.advanced_button.setCheckable(True); self.advanced_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            self.advanced_button.setArrowType(Qt.ArrowType.RightArrow); self.advanced_button.setObjectName("advancedButton")
+            advanced_layout.addWidget(self.advanced_button)
+            details = QWidget(); form = QFormLayout(details); form.setContentsMargins(2,8,2,8)
+            self.threads = QSpinBox(); self.threads.setRange(1,min(4,os.cpu_count() or 2)); self.threads.setValue(self.settings.threads)
+            self.threads.setToolTip("Two threads is a good starting point with your browser open.")
+            self.chunk = QDoubleSpinBox(); self.chunk.setRange(2,10); self.chunk.setSingleStep(.5)
+            self.chunk.setSuffix(" seconds"); self.chunk.setValue(self.settings.chunk_seconds)
+            self.silence = QDoubleSpinBox(); self.silence.setRange(.3,1.5); self.silence.setSingleStep(.1)
+            self.silence.setSuffix(" seconds"); self.silence.setValue(self.settings.silence_seconds)
+            self.gate = QSpinBox(); self.gate.setRange(-70,-20); self.gate.setSuffix(" dB"); self.gate.setValue(self.settings.gate_db)
+            form.addRow("CPU threads",self.threads); form.addRow("Maximum phrase",self.chunk)
+            form.addRow("End phrase after silence",self.silence); form.addRow("Speech gate",self.gate)
+            advanced_layout.addWidget(details); details.hide()
+            def expand(checked):
+                details.setVisible(checked)
+                self.advanced_button.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+            self.advanced_button.toggled.connect(expand); layout.addWidget(advanced); layout.addStretch()
             self.mode.currentIndexChanged.connect(self.mode_changed)
             self.language.currentTextChanged.connect(self.save_preferences)
-            for control in (self.threads, self.chunk, self.silence, self.gate):
+            for control in (self.threads,self.chunk,self.silence,self.gate):
                 control.valueChanged.connect(self.save_preferences)
+            self.sync_mode_cards()
+
+        def sync_mode_cards(self):
+            for model, button in self.mode_cards.items():
+                button.setChecked(model == self.mode.currentData())
 
         def make_caption_tab(self):
             layout = self.form_page("Captions")
-            group = QGroupBox("Appearance · changes apply immediately")
-            form = QFormLayout(group)
-            self.screen_combo = QComboBox()
-            self.refresh_screens(initial=True)
-            form.addRow("Display", self.screen_combo)
-            self.caption_controls = {}
-            specs = [("Font size", "font_size", 16, 56), ("Background opacity %", "opacity", 15, 100),
-                     ("Width % of display", "width_percent", 35, 95),
-                     ("Distance from bottom %", "bottom_percent", 0, 70),
-                     ("Clear caption after seconds", "display_seconds", 3, 30)]
-            for label, key, low, high in specs:
-                control = QSpinBox()
-                control.setRange(low, high)
-                control.setValue(getattr(self.settings, key))
-                control.valueChanged.connect(lambda _value, k=key: self.appearance_changed(k))
-                self.caption_controls[key] = control
-                form.addRow(label, control)
-            self.lock_box = QCheckBox("Lock overlay and pass mouse clicks through it")
-            self.lock_box.setChecked(self.settings.locked)
-            self.lock_box.toggled.connect(self.lock_changed)
-            form.addRow("", self.lock_box)
-            layout.addWidget(group)
-            row = QHBoxLayout()
-            preview = QPushButton("Preview captions")
-            preview.clicked.connect(self.preview)
-            reset = QPushButton("Reset caption position")
-            reset.clicked.connect(self.reset_overlay)
-            row.addWidget(preview)
-            row.addWidget(reset)
-            layout.addLayout(row)
-            note = QLabel("Drag the caption box while unlocked. Lock it when watching a video.\n"
-                          "Use windowed or borderless fullscreen if exclusive fullscreen hides the overlay.")
-            note.setWordWrap(True)
-            note.setObjectName("muted")
-            layout.addWidget(note)
-            layout.addStretch()
+            self.caption_grid = QGridLayout(); self.caption_grid.setSpacing(14)
+            left = QVBoxLayout(); left.setSpacing(14)
+            self.caption_right = QVBoxLayout(); self.caption_right.setSpacing(14)
+            frame, card = self.card("Make it yours", "Adjustments apply immediately. Preview to position your floating captions.")
+            form = QFormLayout(); form.setVerticalSpacing(12)
+            self.screen_combo = QComboBox(); self.refresh_screens(initial=True); form.addRow("Display",self.screen_combo)
+            self.caption_controls = {}; self.caption_sliders = {}
+            specs = (("Text size", "font_size",16,56," pt"), ("Glass opacity", "opacity",15,100," %"),
+                     ("Caption width", "width_percent",35,95," %"), ("Bottom spacing", "bottom_percent",0,70," %"),
+                     ("Keep visible", "display_seconds",3,30," sec"))
+            for label,key,low,high,suffix in specs:
+                control = QSpinBox(); control.setRange(low,high); control.setValue(getattr(self.settings,key))
+                control.setSuffix(suffix); control.setFixedWidth(84)
+                slider = QSlider(Qt.Orientation.Horizontal); slider.setRange(low,high); slider.setValue(control.value())
+                slider.valueChanged.connect(control.setValue); control.valueChanged.connect(slider.setValue)
+                self.caption_controls[key] = control; self.caption_sliders[key] = slider
+                control.valueChanged.connect(lambda _value,k=key: self.appearance_changed(k))
+                row = QHBoxLayout(); row.setSpacing(9); row.addWidget(slider,1); row.addWidget(control)
+                form.addRow(label,row)
+            card.addLayout(form)
+            self.lock_box = QCheckBox("Lock captions · let clicks pass through")
+            self.lock_box.setChecked(self.settings.locked); self.lock_box.toggled.connect(self.lock_changed)
+            card.addWidget(self.lock_box); left.addWidget(frame); left.addStretch()
+            frame, preview_layout = self.card("A quieter way to understand", "Your captions above whatever you're watching.")
+            self.style_preview = CaptionPreview(self.settings); self.style_preview.setFixedHeight(210)
+            preview_layout.addWidget(self.style_preview); self.caption_right.addWidget(frame)
+            frame, actions = self.card("Find your perfect spot")
+            preview = QPushButton("Preview floating captions"); preview.setObjectName("primary"); preview.clicked.connect(self.preview)
+            reset = QPushButton("Reset position"); reset.clicked.connect(self.reset_overlay)
+            actions.addWidget(preview); actions.addWidget(reset)
+            note = QLabel("Drag the preview while unlocked. Lock it when you're ready to watch.\n\nUse windowed or borderless playback if fullscreen hides your captions.")
+            note.setWordWrap(True); note.setObjectName("muted"); actions.addWidget(note)
+            self.caption_right.addWidget(frame); self.caption_right.addStretch()
+            self.caption_grid.addLayout(left,0,0); self.caption_grid.addLayout(self.caption_right,0,1)
+            self.caption_grid.setColumnStretch(0,1); self.caption_grid.setColumnStretch(1,1)
+            layout.addLayout(self.caption_grid); layout.addStretch()
             self.screen_combo.currentIndexChanged.connect(lambda _: self.appearance_changed("screen"))
 
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            self.update_layout_density()
+
+        def update_layout_density(self):
+            if not hasattr(self,"caption_grid") or not hasattr(self,"studio_grid"):
+                return
+            compact = self.width() < 1020
+            if getattr(self,"compact_layout",None) == compact:
+                return
+            self.compact_layout = compact
+            for grid,right in ((self.studio_grid,self.studio_right),(self.caption_grid,self.caption_right)):
+                grid.removeItem(right)
+                grid.addLayout(right,1 if compact else 0,0 if compact else 1)
+                grid.setColumnStretch(0,1); grid.setColumnStretch(1,0 if compact else 1)
+
         def make_history_tab(self):
-            page = QWidget()
-            layout = QVBoxLayout(page)
-            note = QLabel("Last 500 captions · held in memory until you export them")
-            note.setObjectName("muted")
-            layout.addWidget(note)
-            self.history_view = QPlainTextEdit()
-            self.history_view.setReadOnly(True)
-            self.history_view.setMaximumBlockCount(1000)
-            layout.addWidget(self.history_view)
+            page = QWidget(); layout = QVBoxLayout(page); layout.setContentsMargins(0,0,0,0); layout.setSpacing(14)
+            frame, card = self.card("The conversation so far", "Your latest 500 captions. Kept in memory until you choose to export.")
+            self.history_view = QPlainTextEdit(); self.history_view.setReadOnly(True)
+            self.history_view.setPlaceholderText("Your captions will appear here.\n\nStart listening in Studio, then come back to revisit a phrase.")
+            self.history_view.setMaximumBlockCount(1000); card.addWidget(self.history_view,1)
+            layout.addWidget(frame,1)
             row = QHBoxLayout()
-            export = QPushButton("Export text…")
-            export.clicked.connect(self.export_history)
-            clear = QPushButton("Clear history")
-            clear.clicked.connect(self.clear_history)
-            row.addWidget(export)
-            row.addWidget(clear)
-            layout.addLayout(row)
-            self.tabs.addTab(page, "History")
+            export = QPushButton("Export transcript…"); export.setObjectName("primary"); export.clicked.connect(self.export_history)
+            clear = QPushButton("Clear history"); clear.clicked.connect(self.clear_history)
+            row.addWidget(export); row.addWidget(clear); row.addStretch(); layout.addLayout(row)
+            self.tabs.addTab(page,"History")
 
         def refresh_screens(self, initial=False):
             if not hasattr(self, "screen_combo"):
@@ -1419,6 +1659,7 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
                     self.warning.setText("Could not save preferences. Check that the app data folder is writable.")
 
         def mode_changed(self, *_):
+            self.sync_mode_cards()
             self.save_preferences()
             self.update_model_status()
             self.update_controls()
@@ -1430,6 +1671,9 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
 
         def update_controls(self):
             busy = self.engine is not None or self.downloading
+            self.state_badge.setText("●  ACTIVE" if self.engine and not self.engine.stop_event.is_set() else "●  STOPPING" if self.engine else "●  MODEL SETUP" if self.downloading else "●  ON-DEVICE")
+            for button in self.mode_cards.values():
+                button.setEnabled(not busy)
             for control in (self.mode, self.language, self.threads, self.chunk, self.silence, self.gate):
                 control.setEnabled(not busy)
             self.devices.setEnabled(not busy and not self.scanning)
@@ -1570,6 +1814,8 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
             if reposition:
                 self.settings.overlay_x = self.settings.overlay_y = -1
             self.overlay.apply_settings(reposition=reposition)
+            self.studio_preview.update()
+            self.style_preview.update()
             if self.overlay.text:
                 self.overlay.set_caption(self.overlay.text.replace("\n", " "))
             self.save_preferences()
@@ -1604,10 +1850,14 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
                 self.warning.setText(value)
             elif kind == "level":
                 self.meter.setValue(round(value + 80))
+                self.audio_scope.push(value)
+                self.audio_level_text.setText(f"Playback level  {value:.0f} dB" if value > -79 else "Waiting for playback audio")
                 self.meter.setFormat(f"{value:.0f} dB")
             elif kind == "caption":
                 if self.engine and not self.engine.stop_event.is_set():
                     self.overlay.set_caption(value)
+                    self.studio_preview.caption = value
+                    self.studio_preview.update()
                     line = f"[{dt.datetime.now().strftime('%H:%M:%S')}] {value}"
                     self.history.append(line)
                     self.history_view.appendPlainText(line)
@@ -1632,6 +1882,9 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
                 self.overlay.clear()
                 self.meter.setValue(0)
                 self.meter.setFormat("Audio level")
+                self.audio_scope.values = collections.deque([.02]*48, maxlen=48)
+                self.audio_scope.update()
+                self.audio_level_text.setText("Waiting for playback audio")
                 self.status.setText("Stopped — ready to start again")
                 self.update_controls()
                 if self.want_close:
@@ -1732,34 +1985,97 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
     app.setOrganizationName("OfflineLiveCaptions")
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
+    palette = QPalette()
+    for role, color in ((QPalette.ColorRole.Window, "#0c1423"), (QPalette.ColorRole.WindowText, "#e5ecf6"),
+                        (QPalette.ColorRole.Base, "#101c2e"), (QPalette.ColorRole.AlternateBase, "#16243a"),
+                        (QPalette.ColorRole.Text, "#e5ecf6"), (QPalette.ColorRole.Button, "#203149"),
+                        (QPalette.ColorRole.ButtonText, "#d6e5f8"), (QPalette.ColorRole.Highlight, "#365576"),
+                        (QPalette.ColorRole.HighlightedText, "#ffffff")):
+        palette.setColor(role, QColor(color))
+    app.setPalette(palette)
+
     app_lock = QLockFile(str(root / "application.lock"))
     if not smoke_test and not app_lock.tryLock(0):
         QMessageBox.information(None, APP_NAME, "Live Captions is already running, or its data folder is locked.\n"
                                 "Restore it from the CC icon in the Windows system tray.")
         return 0
     app.setStyleSheet("""
-        QWidget { background: #111827; color: #e5e7eb; font-family: 'Segoe UI'; font-size: 13px; }
-        QLabel#title { font-size: 29px; font-weight: 700; }
-        QLabel#muted { color: #9ca3af; }
-        QTabWidget::pane { border: 1px solid #334155; border-radius: 9px; }
-        QTabBar::tab { padding: 11px 18px; background: #172033; color: #aab8ca; }
-        QTabBar::tab:selected { background: #26364d; color: #ffffff; }
-        QGroupBox { border: 1px solid #334155; border-radius: 8px; margin-top: 15px; padding: 16px 10px 10px; }
-        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; color: #b9cbe5; }
-        QPushButton { background: #26364d; border: 1px solid #41536d; border-radius: 6px; padding: 9px 14px; }
-        QPushButton:hover { background: #344a68; }
-        QPushButton:disabled { background: #182234; color: #64748b; border-color: #26364d; }
-        QPushButton#primary { background: #2563eb; border-color: #3b82f6; color: white; font-weight: 600; }
-        QPushButton#primary:disabled { background: #1e3456; border-color: #26364d; color: #8395ae; }
-        QComboBox, QSpinBox, QDoubleSpinBox { background: #0c1424; border: 1px solid #41536d; border-radius: 5px; padding: 7px; min-height: 19px; }
-        QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { color: #64748b; }
-        QPlainTextEdit { background: #0c1424; border: 1px solid #334155; border-radius: 6px; padding: 8px; }
-        QProgressBar { border: 1px solid #334155; border-radius: 5px; text-align: center; background: #0c1424; min-height: 18px; }
-        QProgressBar::chunk { background: #3b82f6; border-radius: 4px; }
-        QCheckBox { spacing: 10px; padding: 7px 0; }
-        QMenu { background: #172033; border: 1px solid #41536d; }
-        QMenu::item { padding: 7px 20px; }
-        QMenu::item:selected { background: #344a68; }
+        QWidget { color: #e5ecf6; font-family: 'Segoe UI'; font-size: 13px; background: transparent; }
+        QMainWindow { background: #090e1a; }
+        QFrame#sidebar { background: rgba(7,12,23,185); border-right: 1px solid rgba(183,208,249,18); }
+        QLabel#brandMark { color: #efffff; font-size: 20px; font-weight: 800; border-radius: 14px;
+          border: 1px solid rgba(216,255,244,85); background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #6b8abf,stop:.5 #5f7aa9,stop:1 #356d78); }
+        QLabel#brandTitle { font-size: 17px; font-weight: 700; padding-top: 9px; }
+        QLabel#pageTitle { font-size: 28px; font-weight: 700; color: #f3f6fc; }
+        QLabel#subtitle { font-size: 13px; color: #94a5bf; }
+        QLabel#sectionTitle { font-size: 14px; font-weight: 650; color: #e8effa; }
+        QLabel#eyebrow { font-size: 10px; font-weight: 700; color: #8297b4; padding-top: 3px; }
+        QLabel#muted { font-size: 12px; color: #93a6bf; }
+        QLabel#version { font-size: 10px; color: #637a98; }
+        QLabel#accentText { color: #91d9ca; font-size: 12px; }
+        QLabel#stateBadge { border: 1px solid rgba(132,221,205,40); border-radius: 12px; color: #8ed8c9;
+          font-size: 10px; font-weight: 650; background: rgba(80,165,147,15); padding: 7px 10px; }
+        QFrame#glassCard { border: 1px solid rgba(197,220,255,27); border-radius: 17px;
+          background: qlineargradient(x1:0,y1:0,x2:.4,y2:1,stop:0 rgba(46,65,89,130),stop:1 rgba(23,34,54,150)); }
+        QFrame#controlDock { border: 1px solid rgba(195,218,255,32); border-radius: 15px; background: rgba(23,34,54,205); }
+        QLabel#statusText { font-size: 12px; color: #b3c3d9; }
+        QLabel#warningLabel { font-size: 12px; color: #e7bd84; }
+        QTabWidget#workspaceTabs::pane { border: 0; background: transparent; }
+        QPushButton { background: rgba(139,163,202,12); border: 1px solid rgba(184,211,250,38);
+          border-radius: 10px; padding: 10px 14px; min-height: 18px; font-weight: 550; }
+        QPushButton:hover { border-color: rgba(170,210,243,115); background: rgba(151,189,230,23); }
+        QPushButton:pressed { background: rgba(132,166,222,42); border-color: #a2c0e4; }
+        QPushButton:focus { border-color: #88b8d8; }
+        QPushButton:disabled { color: #60718b; border-color: rgba(150,170,210,16); background: rgba(70,90,125,12); }
+        QPushButton#navButton { text-align: left; border-color: transparent; color: #8ea2bf; background: transparent;
+          padding: 10px 9px; border-radius: 10px; font-size: 13px; }
+        QPushButton#navButton:hover { color: #dbe9fd; background: rgba(113,149,208,13); }
+        QPushButton#navButton:checked { color: #eff6ff; border-color: rgba(139,177,235,43);
+          background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(111,143,207,40),stop:1 rgba(80,115,172,14)); }
+        QPushButton#primary { color: #101c2b; font-weight: 700; border-color: rgba(195,251,237,130);
+          background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #a3e4d6,stop:1 #7cbed1); }
+        QPushButton#primary:hover { background: #b7f0e3; border-color: #d0fff3; }
+        QPushButton#primary:pressed { background: #79bcbe; }
+        QPushButton#primary:disabled { background: rgba(117,164,175,30); color: #657e8c; border-color: rgba(140,190,192,25); }
+        QPushButton#modeCard { text-align: left; border-radius: 11px; padding: 7px 11px; color: #91a3bd; font-size: 12px; }
+        QPushButton#modeCard:checked { color: #e9eefb; border-color: rgba(163,174,234,130);
+          background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(124,139,204,65),stop:1 rgba(98,111,164,22)); }
+        QPushButton#modeCard:disabled { color: #7889a4; }
+        QPushButton#quietButton { border: 0; color: #9ebbd7; font-size: 11px; min-height: 12px; padding: 5px 0; text-align: left; background: transparent; }
+        QPushButton#quietButton:hover { color: #b3ede5; }
+        QToolButton#advancedButton { border: 0; color: #a1b4cf; padding: 6px; text-align: left; }
+        QToolButton#advancedButton:hover { color: #e9f5ff; }
+        QComboBox, QSpinBox, QDoubleSpinBox { background: rgba(6,14,27,130); border: 1px solid rgba(165,195,235,40);
+          border-radius: 9px; padding: 9px 11px; min-height: 19px; selection-background-color: #354f71; }
+        QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: rgba(156,195,228,100); }
+        QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #7babbc; }
+        QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { color: #5c6e88; }
+        QComboBox::drop-down { border: 0; width: 27px; }
+        QComboBox QAbstractItemView { background: #142136; color: #dce9fa; border: 1px solid #354966;
+          selection-background-color: #304766; selection-color: white; outline: 0; padding: 5px; }
+        QSpinBox::up-button, QDoubleSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::down-button { width: 18px; border: 0; }
+        QPlainTextEdit { background: rgba(8,16,30,140); border: 1px solid rgba(174,200,238,25); border-radius: 12px;
+          padding: 14px; selection-background-color: #3a5777; font-size: 13px; }
+        QProgressBar { border: 0; border-radius: 3px; background: rgba(121,155,195,17); text-align: center; max-height: 7px; }
+        QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #6789b9,stop:1 #8edccc); border-radius: 3px; }
+        QSlider::groove:horizontal { height: 4px; border-radius: 2px; background: rgba(133,163,198,32); }
+        QSlider::sub-page:horizontal { background: #82bbbc; border-radius: 2px; }
+        QSlider::handle:horizontal { width: 13px; height: 13px; margin: -5px 0; border-radius: 7px; background: #ade7db; border: 1px solid #d0f5eb; }
+        QSlider::handle:horizontal:hover { background: #e0fff3; }
+        QCheckBox { spacing: 10px; padding: 7px 0; color: #b3c5dc; }
+        QCheckBox::indicator { width: 17px; height: 17px; border-radius: 5px; border: 1px solid #4a627e; background: #142237; }
+        QCheckBox::indicator:checked { background: #90d8c8; border-color: #c2e9de; }
+        QScrollArea { border: 0; background: transparent; }
+        QScrollBar:vertical { width: 6px; background: transparent; margin: 3px 0; }
+        QScrollBar::handle:vertical { background: rgba(142,169,210,62); border-radius: 3px; min-height: 35px; }
+        QScrollBar::handle:vertical:hover { background: rgba(142,190,220,110); }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        QMenu { background: #142136; border: 1px solid #354966; border-radius: 8px; padding: 5px; }
+        QMenu::item { padding: 9px 20px; border-radius: 5px; }
+        QMenu::item:selected { background: #304766; }
+        QToolTip { background: #192a40; color: #dbe8fb; border: 1px solid #425d7c; padding: 7px; }
+        QMessageBox { background: #142136; }
     """)
     pixmap = QPixmap(64, 64)
     pixmap.fill(QColor("#2563eb"))
