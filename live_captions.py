@@ -2,15 +2,13 @@
 """Live Captions — offline system-audio translation to English, Windows 10/11.
 
 One source file, native Qt interface, no web server or API key.
-Recommended: 64-bit Python 3.11 or 3.12 from python.org (include Tcl/Tk).
-Run: py -3.11 live_captions.py
-First launch offers dependency installation. Download a model inside the app,
-then Start. Translation uses only local files; internet is used only for setup.
-
-Manual dependency installation (same interpreter used to run this file):
-  python -m pip install "PySide6-Essentials==6.8.3" "faster-whisper==1.2.1" \
-    "PyAudioWPatch==0.2.12.7" "numpy>=1.26,<3" "scipy>=1.11,<2" \
-    "huggingface-hub>=0.24,<1"
+Run with an existing Python installation: py live_captions.py
+Automatic setup downloads a private 64-bit Python 3.12.10, pip, all app libraries,
+and both speech models. It installs Microsoft's C++ runtime if missing (Windows
+may request administrator approval). No compiler, FFmpeg program, or API key is
+needed. The caption window opens automatically when setup completes.
+Translation then runs offline. Your existing Python installation is unchanged.
+To repair: py live_captions.py --repair-setup
 
 Captures the selected Windows output device, including other apps using it.
 This is delayed live translation, not subtitles synchronized to the video clock.
@@ -40,14 +38,17 @@ import time
 import traceback
 
 APP_NAME = "Live Captions"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEPENDENCIES = [
     ("PySide6", "PySide6-Essentials==6.8.3"),
     ("faster_whisper", "faster-whisper==1.2.1"),
     ("pyaudiowpatch", "PyAudioWPatch==0.2.12.7"),
-    ("numpy", "numpy>=1.26,<3"),
-    ("scipy", "scipy>=1.11,<2"),
+    ("numpy", "numpy==1.26.4"),
+    ("scipy", "scipy==1.13.1"),
     ("huggingface_hub", "huggingface-hub>=0.24,<1"),
+    ("ctranslate2", "ctranslate2==4.6.0"),
+    ("onnxruntime", "onnxruntime==1.22.1"),
+    ("av", "av==14.2.0"),
 ]
 LANGUAGES = {
     "Automatic detection": None, "Japanese": "ja", "Russian": "ru",
@@ -447,48 +448,416 @@ def download_model(root, model, emit):
         emit("download_error", str(exc))
 
 
-def bootstrap_dependencies():
-    missing = [spec for module, spec in DEPENDENCIES if importlib.util.find_spec(module) is None]
-    if not missing:
-        return True
-    # Standard-library installer so the file can be launched before Qt exists.
-    import tkinter as tk
-    from tkinter import messagebox, scrolledtext
-    root = tk.Tk()
-    root.title("Live Captions — first-time setup")
-    root.geometry("740x470")
-    root.configure(bg="#111827")
-    tk.Label(root, text="Install the app's Python libraries", font=("Segoe UI", 19, "bold"),
-             fg="white", bg="#111827").pack(anchor="w", padx=20, pady=(20, 8))
-    tk.Label(root, text="One-time internet setup. No browser, account, or API key required.\n"
-             "After installation, download a speech model inside the app.",
-             fg="#cbd5e1", bg="#111827", justify="left").pack(anchor="w", padx=20)
-    output = scrolledtext.ScrolledText(root, height=16, bg="#080f1d", fg="#d1d5db", wrap="word")
-    output.pack(fill="both", expand=True, padx=20, pady=14)
-    output.insert("end", "Required packages:\n" + "\n".join(spec for _, spec in DEPENDENCIES) + "\n")
+class SetupCancelled(Exception):
+    pass
+
+
+def runtime_dir(root):
+    return root / "python-3.12.10"
+
+
+def runtime_python(root):
+    return runtime_dir(root) / "python.exe"
+
+
+def runtime_complete(root):
+    folder = runtime_dir(root)
+    return all((folder / name).is_file() for name in (
+        "python.exe", "python312.dll", "python312.zip", "python312._pth", ".runtime-complete"))
+
+
+def setup_fingerprint():
+    import hashlib
+    payload = json.dumps({"revision": 2, "python": "3.12.10", "packages": DEPENDENCIES}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def setup_ready(root):
+    try:
+        data = json.loads((root / "setup-ready.json").read_text(encoding="utf-8"))
+        return (data.get("fingerprint") == setup_fingerprint() and runtime_complete(root)
+                and all(model_ready(root, model) for model in ("base", "small")))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def acquire_setup_lock(root):
+    handle = (root / "setup.lock").open("a+b")
+    try:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except Exception:
+        handle.close()
+        raise
+
+
+class SetupRunner:
+    """Install into app data, never into the user's global Python environment."""
+    def __init__(self, root, emit, repair=False):
+        self.root = Path(root)
+        self.emit = emit
+        self.repair = repair
+        self.cancelled = threading.Event()
+        self.process = None
+        self.process_lock = threading.Lock()
+        self.tail = collections.deque(maxlen=24)
+
+    def cancel(self):
+        self.cancelled.set()
+        with self.process_lock:
+            if self.process is not None:
+                try:
+                    self.process.terminate()
+                except OSError:
+                    pass
+
+    def check_cancel(self):
+        if self.cancelled.is_set():
+            raise SetupCancelled("Setup cancelled. Open the file again to resume.")
+
+    def log(self, text):
+        text = str(text)
+        for line in text.splitlines():
+            self.tail.append(line)
+        self.emit(text if text.endswith("\n") else text + "\n")
+
+    def command(self, args, title, allow_failure=False):
+        self.check_cancel()
+        self.log("\n" + title)
+        process = subprocess.Popen(
+            [str(arg) for arg in args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"},
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        with self.process_lock:
+            self.process = process
+            if self.cancelled.is_set():
+                process.terminate()
+        try:
+            for line in process.stdout:
+                self.check_cancel()
+                # Model-download subprocess emits JSON status messages.
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, list) and len(event) == 2:
+                        line = str(event[1])
+                except (ValueError, TypeError):
+                    pass
+                self.log(line)
+            code = process.wait()
+            self.check_cancel()
+            if code and not allow_failure:
+                details = "\n".join(self.tail)[-6000:]
+                raise RuntimeError(f"{title} failed (exit {code}).\n\n{details}")
+            return code
+        finally:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+            process.wait()
+            if process.stdout:
+                process.stdout.close()
+            with self.process_lock:
+                if self.process is process:
+                    self.process = None
+
+    def fetch(self, url, destination):
+        """HTTPS download with size checks, atomic completion, retries and logging."""
+        import urllib.request
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        part = destination.with_suffix(destination.suffix + ".part")
+        for attempt in range(3):
+            self.check_cancel()
+            try:
+                self.log(f"Downloading {destination.name} (attempt {attempt + 1}/3)…")
+                request = urllib.request.Request(url, headers={"User-Agent": f"OfflineLiveCaptions/{VERSION}"})
+                with urllib.request.urlopen(request, timeout=30) as response, part.open("wb") as target:
+                    total = int(response.headers.get("Content-Length", 0))
+                    received = 0
+                    last_report = 0.0
+                    while True:
+                        self.check_cancel()
+                        block = response.read(256 * 1024)
+                        if not block:
+                            break
+                        target.write(block)
+                        received += len(block)
+                        now = time.monotonic()
+                        if now - last_report >= 1:
+                            suffix = f" / {total / 1024**2:.1f} MB" if total else " MB"
+                            self.log(f"  {destination.name}: {received / 1024**2:.1f}{suffix}")
+                            last_report = now
+                    if received == 0 or (total and received != total):
+                        raise OSError("Download incomplete. The connection ended early.")
+                os.replace(part, destination)
+                return destination
+            except SetupCancelled:
+                raise
+            except Exception as exc:
+                self.log(f"Download error: {exc}")
+                if attempt == 2:
+                    raise RuntimeError(f"Could not download {destination.name}: {exc}.\n"
+                                       "Check your internet connection and reopen the file to retry.") from exc
+                if self.cancelled.wait(attempt + 1):
+                    self.check_cancel()
+
+    def extract_python(self, archive):
+        import zipfile
+        folder = runtime_dir(self.root)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / ".runtime-complete").unlink(missing_ok=True)
+        base = folder.resolve()
+        with zipfile.ZipFile(archive) as bundle:
+            for entry in bundle.infolist():
+                self.check_cancel()
+                target = (folder / entry.filename).resolve()
+                if target != base and base not in target.parents:
+                    raise RuntimeError("Invalid path in Python download.")
+                bundle.extract(entry, folder)
+        # The official embeddable distribution isolates its library path. Enable
+        # only this private environment's site-packages, including pip and Qt.
+        site = folder / "Lib" / "site-packages"
+        site.mkdir(parents=True, exist_ok=True)
+        (folder / "python312._pth").write_text(
+            "python312.zip\n.\nLib/site-packages\nimport site\n", encoding="utf-8")
+        self.check_cancel()
+        (folder / ".runtime-complete").write_text("3.12.10", encoding="ascii")
+
+    def runtime_available(self):
+        return self.command(
+            [runtime_python(self.root), "-c",
+             "import ctypes; [ctypes.WinDLL(n) for n in ('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll')]"],
+            "Checking Microsoft C++ runtime", allow_failure=True,
+        ) == 0
+
+    def install_vc_runtime(self):
+        from ctypes import wintypes
+        installer = self.fetch("https://aka.ms/vs/17/release/vc_redist.x64.exe",
+                               self.root / "setup-downloads" / "vc_redist.x64.exe")
+        self.check_cancel()
+        self.log("Installing Microsoft's C++ runtime. Approve the Windows administrator prompt if it appears.\n"
+                 "This Microsoft installer must finish before setup can continue or close.")
+        class ExecuteInfo(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG), ("hwnd", wintypes.HWND),
+                        ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR),
+                        ("lpParameters", wintypes.LPCWSTR), ("lpDirectory", wintypes.LPCWSTR),
+                        ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE),
+                        ("lpIDList", ctypes.c_void_p), ("lpClass", wintypes.LPCWSTR),
+                        ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
+                        ("hIcon", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
+        shell = ctypes.WinDLL("shell32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        shell.ShellExecuteExW.argtypes = [ctypes.POINTER(ExecuteInfo)]
+        shell.ShellExecuteExW.restype = wintypes.BOOL
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        info = ExecuteInfo()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = 0x40 | 0x100  # SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+        info.lpVerb = "runas"
+        info.lpFile = str(installer)
+        info.lpParameters = "/install /passive /norestart"
+        info.nShow = 1
+        if not shell.ShellExecuteExW(ctypes.byref(info)):
+            code = ctypes.get_last_error()
+            if code == 1223:
+                raise RuntimeError("The Windows administrator prompt was declined.\n"
+                                   "Run setup again and approve Microsoft's C++ runtime installer.")
+            raise ctypes.WinError(code)
+        try:
+            while True:
+                status = kernel.WaitForSingleObject(info.hProcess, 250)
+                if status == 0:
+                    break
+                if status != 258:
+                    raise ctypes.WinError(ctypes.get_last_error())
+            code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(info.hProcess, ctypes.byref(code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if code.value not in (0, 1638, 3010):
+                raise RuntimeError(f"Microsoft's C++ runtime installer failed (exit {code.value}).")
+            if code.value == 3010:
+                self.log("Windows reports that a restart may be needed for the C++ runtime.")
+        finally:
+            kernel.CloseHandle(info.hProcess)
+        self.check_cancel()
+
+    def validate(self, allow_failure=False):
+        modules = [name for name, _ in DEPENDENCIES]
+        script = ("import sys, struct; assert sys.version_info[:2] == (3,12); "
+                  "assert struct.calcsize('P') == 8; "
+                  + "; ".join("__import__(" + repr(name) + ")" for name in modules)
+                  + "; from PySide6 import QtWidgets; from scipy.signal import resample_poly; "
+                  "from faster_whisper.vad import get_vad_model; get_vad_model(); "
+                  "print('All application libraries loaded successfully.')")
+        return self.command([runtime_python(self.root), "-c", script], "Checking installed libraries", allow_failure)
+
+    def run(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.log(f"Live Captions {VERSION} automatic setup\n"
+                 f"Private installation folder: {self.root}\n"
+                 f"Starting Python: {sys.version.split()[0]} ({struct.calcsize('P') * 8}-bit)\n"
+                 "Your existing Python installation will not be modified.")
+        completed = setup_ready(self.root) and not self.repair
+        if completed and self.validate(allow_failure=True) == 0:
+            self.log("Setup is already complete. Starting Live Captions…")
+            return
+        self.check_cancel()
+        (self.root / "setup-ready.json").unlink(missing_ok=True)
+        if not runtime_complete(self.root) or self.repair or completed:
+            import zipfile
+            archive = self.root / "setup-downloads" / "python-3.12.10-embed-amd64.zip"
+            valid_archive = False
+            try:
+                with zipfile.ZipFile(archive) as bundle:
+                    valid_archive = bundle.testzip() is None and {
+                        "python.exe", "python312.dll", "python312.zip", "_ssl.pyd"
+                    }.issubset(bundle.namelist())
+            except (OSError, zipfile.BadZipFile):
+                pass
+            if not valid_archive:
+                archive = self.fetch(
+                    "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip", archive)
+            self.log("Extracting private 64-bit Python 3.12.10…")
+            self.extract_python(archive)
+            if not runtime_complete(self.root):
+                raise RuntimeError("The private Python download did not extract completely. Retry setup.")
+        else:
+            # Also repairs a missing/changed private library path file.
+            (runtime_dir(self.root) / "Lib" / "site-packages").mkdir(parents=True, exist_ok=True)
+            (runtime_dir(self.root) / "python312._pth").write_text(
+                "python312.zip\n.\nLib/site-packages\nimport site\n", encoding="utf-8")
+        if not self.runtime_available():
+            self.install_vc_runtime()
+            if not self.runtime_available():
+                raise RuntimeError("Microsoft's C++ runtime is still unavailable. Restart Windows, then open this file again.")
+        pip_exists = self.command([runtime_python(self.root), "-m", "pip", "--version"],
+                                  "Checking package installer", allow_failure=True) == 0
+        if not pip_exists:
+            script = self.fetch("https://bootstrap.pypa.io/get-pip.py", self.root / "setup-downloads" / "get-pip.py")
+            self.command([runtime_python(self.root), script, "pip>=24,<27", "setuptools>=70,<83", "wheel>=0.43,<1",
+                          "--only-binary=:all:", "--disable-pip-version-check", "--no-warn-script-location"],
+                         "Installing pip, setuptools and wheel")
+        pip = [runtime_python(self.root), "-m", "pip", "--isolated", "--disable-pip-version-check", "--no-input",
+               "install", "--upgrade", "--only-binary=:all:", "--retries", "3", "--timeout", "30",
+               "--no-warn-script-location"]
+        self.command(pip + ["pip>=24,<27", "setuptools>=70,<83", "wheel>=0.43,<1"], "Updating package installer")
+        packages = [spec for _, spec in DEPENDENCIES]
+        if self.repair or completed:
+            packages = ["--force-reinstall"] + packages
+        self.command(pip + packages, "Installing all speech, audio and interface libraries")
+        self.validate()
+        for model in ("small", "base"):
+            if not model_ready(self.root, model):
+                self.command([runtime_python(self.root), Path(__file__).resolve(), "--download-model", model,
+                              "--data-dir", self.root], f"Downloading and checking {model} speech model")
+            if not model_ready(self.root, model):
+                raise RuntimeError(f"The {model} model did not finish downloading. Reopen the file to resume.")
+        self.check_cancel()
+        tmp = self.root / "setup-ready.tmp"
+        tmp.write_text(json.dumps({"fingerprint": setup_fingerprint()}), encoding="utf-8")
+        os.replace(tmp, self.root / "setup-ready.json")
+        self.log("All components and both speech models are ready. Starting Live Captions…")
+
+
+def native_error(title, detail):
+    if sys.platform == "win32":
+        ctypes.windll.user32.MessageBoxW(None, str(detail), str(title), 0x10)
+    else:
+        print(f"{title}: {detail}", file=sys.stderr)
+
+
+def bootstrap_dependencies(root=None, repair=False):
+    root = Path(root or app_dir())
+    root.mkdir(parents=True, exist_ok=True)
+    log_path = root / "setup.log"
     messages = queue.Queue()
-    state = {"running": False, "process": None}
+    runner = SetupRunner(root, lambda value: messages.put(("line", value)), repair=repair)
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, scrolledtext
+        window = tk.Tk()
+    except Exception:
+        # Some Python distributions omit Tk. Setup itself only needs the standard
+        # library, and the finished application uses Qt, so it can still proceed.
+        with log_path.open("w", encoding="utf-8", buffering=1) as setup_log:
+            runner.emit = setup_log.write
+            try:
+                runner.run()
+                return True
+            except Exception as exc:
+                setup_log.write(traceback.format_exc())
+                native_error("Setup failed", f"{exc}\n\nDetails: {log_path}")
+                return False
+    window.title(f"Live Captions {VERSION} — automatic setup")
+    window.geometry("850x620")
+    window.minsize(650, 450)
+    window.configure(bg="#111827")
+    tk.Label(window, text="Setting up Live Captions", font=("Segoe UI", 21, "bold"),
+             fg="white", bg="#111827").pack(anchor="w", padx=20, pady=(20, 8))
+    tk.Label(window, text="Downloads compatible Python, all libraries and both speech models.\n"
+             "Setup starts automatically. The caption window opens when it finishes.",
+             fg="#cbd5e1", bg="#111827", justify="left").pack(anchor="w", padx=20)
+    status = tk.StringVar(value="Preparing automatic setup…")
+    tk.Label(window, textvariable=status, fg="#93c5fd", bg="#111827", anchor="w",
+             wraplength=790, justify="left").pack(fill="x", padx=20, pady=(12, 0))
+    output = scrolledtext.ScrolledText(window, height=18, bg="#080f1d", fg="#d1d5db", wrap="word")
+    output.pack(fill="both", expand=True, padx=20, pady=14)
+    state = {"running": False, "success": False, "closing": False, "log": None, "attempted": False}
+    def emit(text):
+        if state["log"]:
+            state["log"].write(text)
+            state["log"].flush()
+        messages.put(("line", text))
+    runner.emit = emit
     def install():
+        if state["running"]:
+            return
         state["running"] = True
-        button.configure(state="disabled", text="Installing…")
+        state["closing"] = False
+        if state["attempted"]:
+            runner.repair = True
+        state["attempted"] = True
+        runner.tail.clear()
+        runner.cancelled.clear()
+        try:
+            state["log"] = log_path.open("w", encoding="utf-8")
+        except OSError as exc:
+            state["running"] = False
+            messagebox.showerror("Cannot write setup log", f"{exc}\n\nCheck write access to {root} and retry setup.")
+            return
+        output.delete("1.0", "end")
+        retry.configure(state="disabled")
+        cancel.configure(state="normal", text="Cancel setup")
         def worker():
             try:
-                # pythonw.exe has no console; use the paired python.exe for pip.
-                command = [console_python(), "-m", "pip", "install", "--disable-pip-version-check"]
-                if sys.prefix == sys.base_prefix:
-                    command.append("--user")
-                command += [spec for _, spec in DEPENDENCIES]
-                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                           text=True, encoding="utf-8", errors="replace",
-                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                state["process"] = process
-                for line in process.stdout:
-                    messages.put(("line", line))
-                messages.put(("done", process.wait()))
+                runner.run()
+                messages.put(("done", None))
+            except SetupCancelled as exc:
+                emit(str(exc) + "\n")
+                messages.put(("cancelled", str(exc)))
             except Exception as exc:
-                messages.put(("line", str(exc) + "\n"))
-                messages.put(("done", 1))
-        threading.Thread(target=worker, daemon=True).start()
+                LOG.exception("Automatic setup failed")
+                emit(traceback.format_exc())
+                messages.put(("error", str(exc)))
+        threading.Thread(target=worker, name="automatic-setup", daemon=True).start()
     def poll():
         try:
             while True:
@@ -496,37 +865,71 @@ def bootstrap_dependencies():
                 if kind == "line":
                     output.insert("end", value)
                     output.see("end")
+                    lines = value.strip().splitlines()
+                    if lines:
+                        status.set(lines[-1][:240])
                 else:
                     state["running"] = False
-                    if value == 0:
-                        messagebox.showinfo("Installed", "Setup is complete. Open this Python file again to launch Live Captions.")
-                        root.destroy()
+                    if state["log"]:
+                        state["log"].close()
+                        state["log"] = None
+                    if state["closing"]:
+                        window.destroy()
                         return
-                    button.configure(state="normal", text="Retry installation")
-                    messagebox.showerror("Installation failed", "See the details above. Use 64-bit Python 3.11 or 3.12 from python.org.\n"
-                                         "If pip is missing, run: python -m ensurepip --upgrade")
+                    if kind == "done":
+                        state["success"] = True
+                        window.destroy()
+                        return
+                    retry.configure(state="normal", text="Retry / repair setup")
+                    cancel.configure(text="Close")
+                    if kind == "error":
+                        status.set("Setup failed — the actual error is shown below and saved in setup.log")
+                        messagebox.showerror("Setup failed", value[-4500:] + f"\n\nFull setup log: {log_path}")
+                    else:
+                        status.set("Setup cancelled. Retry to continue.")
         except queue.Empty:
             pass
-        root.after(100, poll)
+        window.after(100, poll)
     def close():
         if state["running"]:
-            if not messagebox.askyesno("Installation running", "Stop dependency installation and close setup?"):
-                return
-            process = state["process"]
-            if process:
-                process.terminate()
-        root.destroy()
-    button = tk.Button(root, text="Install libraries", command=install, padx=20, pady=8)
-    button.pack(pady=(0, 16))
-    root.protocol("WM_DELETE_WINDOW", close)
-    root.after(100, poll)
-    root.mainloop()
-    return False
+            state["closing"] = True
+            runner.cancel()
+            status.set("Cancelling… Waiting for any running installer to finish safely.")
+            cancel.configure(state="disabled")
+        else:
+            window.destroy()
+    def copy_log():
+        window.clipboard_clear()
+        try:
+            window.clipboard_append(log_path.read_text(encoding="utf-8"))
+            status.set("Setup log copied. You can paste it when asking for help.")
+        except OSError:
+            status.set("No setup log has been written yet.")
+    row = tk.Frame(window, bg="#111827")
+    row.pack(fill="x", padx=20, pady=(0, 16))
+    retry = tk.Button(row, text="Install / repair", command=install, padx=16, pady=7)
+    retry.pack(side="left")
+    tk.Button(row, text="Copy setup log", command=copy_log, padx=16, pady=7).pack(side="left", padx=10)
+    cancel = tk.Button(row, text="Cancel setup", command=close, padx=16, pady=7)
+    cancel.pack(side="right")
+    window.protocol("WM_DELETE_WINDOW", close)
+    window.after(100, poll)
+    window.after(300, install)
+    window.mainloop()
+    return state["success"]
 
+
+def launch_managed(root):
+    with (root / "launch.log").open("w", encoding="utf-8") as output:
+        subprocess.Popen([str(runtime_python(root)), str(Path(__file__).resolve()), "--managed-run", "--data-dir", str(root)],
+                         stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 HELP = """QUICK START
-1. Download Quality (small) or Fast (base) on the Translation tab. Download each
-   mode you want to use. Models stay on this computer for later offline use.
+1. Open this Python file. Setup automatically installs a private Python runtime,
+   app libraries and both caption models, then opens the caption window.
+   If Windows asks, approve Microsoft's C++ runtime installer. First setup needs
+   internet and several hundred MB of downloads. Later translation works offline.
 2. Play browser audio through your normal speakers/headphones. Select that
    output device, or use the Windows default from the last refresh. Click Start.
 3. The audio meter should move. English captions appear after a phrase is
@@ -574,14 +977,17 @@ players; exclusive fullscreen may require switching to windowed/borderless.
 Long phrases are split into pages, so the text is not silently clipped.
 
 DATA AND SETUP
-Only explicit dependency/model setup uses the internet. Start loads the model
+Only dependency/model setup uses the internet. Start loads the model
 and tokenizer from local files with local_files_only=True. No audio is uploaded
 or recorded. Caption history is in memory, limited to the latest 500 captions,
 and can be saved as text with Export. Clear history removes that in-memory text.
 Preferences, downloaded models and technical error logs are stored in:
 %LOCALAPPDATA%\\OfflineLiveCaptions
 Logs do not intentionally contain audio or recognized text. Redownloading a model
-repairs an incomplete download. Windows 10/11, 64-bit Python 3.11/3.12 recommended.
+repairs an incomplete download. Windows 10/11 on an x64 PC is required. Setup uses
+its own compatible 64-bit Python; your original Python version is not used to run
+the caption engine. Setup errors include their actual details and are saved to
+setup.log. Use Copy setup log if you need help. Retry / repair resumes setup.
 You may rename the file to .pyw after setup to launch without a console window.
 If a library reports "DLL load failed", install Microsoft's Visual C++ 2015–2022
 Redistributable (x64), then reopen the app.
@@ -1389,6 +1795,8 @@ def run_gui(root: Path, smoke_test=False, test_hook=None):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--managed-run", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--repair-setup", action="store_true", help="Repair the private Python environment and libraries")
     parser.add_argument("--ui-smoke-test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--download-model", choices=("base", "small"), help=argparse.SUPPRESS)
     parser.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
@@ -1397,8 +1805,8 @@ def main():
     if sys.platform != "win32" and not smoke and not args.download_model:
         print("Live Captions requires Windows 10/11 for WASAPI system-audio capture.")
         return 1
-    if struct.calcsize("P") != 8:
-        print("Install 64-bit Python 3.11 or 3.12 to run Live Captions.")
+    if (args.managed_run or args.download_model or smoke) and struct.calcsize("P") != 8:
+        native_error("64-bit Python needed", "The app runtime must be 64-bit. Reopen the file normally to run automatic setup.")
         return 1
     root = args.data_dir or app_dir()
     try:
@@ -1411,21 +1819,24 @@ def main():
                 print(json.dumps([kind, value]), flush=True)
             download_model(root, args.download_model, emit)
             return 0 if result["success"] else 1
-        if not smoke and not bootstrap_dependencies():
+        if not smoke and not args.managed_run:
+            try:
+                setup_lock = acquire_setup_lock(root)
+            except OSError:
+                native_error("Setup is already running", "Another Live Captions setup is using this installation.\n"
+                             "Use the setup window that is already open, or wait for it to close.")
+                return 1
+            try:
+                if bootstrap_dependencies(root, repair=args.repair_setup):
+                    launch_managed(root)
+            finally:
+                setup_lock.close()
             return 0
         return run_gui(root, smoke)
     except Exception:
         LOG.exception("Startup failed")
         detail = traceback.format_exc()
-        try:
-            import tkinter as tk
-            from tkinter import messagebox
-            window = tk.Tk()
-            window.withdraw()
-            messagebox.showerror("Live Captions could not start", detail + "\nRecommended: 64-bit Python 3.11 or 3.12.")
-            window.destroy()
-        except Exception:
-            print(detail, file=sys.stderr)
+        native_error("Live Captions could not start", detail + "\n\nRun the file with --repair-setup to repair its private environment.")
         return 1
 
 
